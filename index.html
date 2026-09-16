@@ -654,7 +654,7 @@
           <table>
             <thead><tr>
               <th style="width:34px"><input type="checkbox" class="checkbox" id="dateGroupSelectAll"></th>
-              <th>التاريخ</th><th>وقت الاستيراد</th><th>عدد الفواتير</th><th>إجمالي القيمة</th>
+              <th>التاريخ</th><th>وقت الاستيراد</th><th>عدد الفواتير</th><th>إجمالي القيمة</th><th>تاريخ جديد (اختياري)</th>
             </tr></thead>
             <tbody id="dateGroupBody"></tbody>
           </table>
@@ -662,7 +662,11 @@
         <div class="row" style="margin-top:14px;align-items:center">
           <button class="btn btn-sm" id="dateGroupRefreshBtn">تحديث الجدول</button>
           <button class="btn btn-accent" id="dateGroupShiftBtn">تحويل المحدد ليوم واحد لاحقًا (+يوم)</button>
+          <button class="btn btn-accent" id="dateGroupCustomBtn">تطبيق التواريخ الجديدة المكتوبة بالأسفل</button>
           <span id="dateGroupSelCount" style="font-size:13px;color:var(--ink-soft)"></span>
+        </div>
+        <div class="note" style="margin-top:10px">
+          الزرار التاني بيشتغل على أي صف كتبت له "تاريخ جديد" في العمود الأخير (مش لازم تحدده بالتيك) — يعني تقدر تحط لكل صف التاريخ الصح المختلف بتاعه بنفسك، مش بس +يوم واحد.
         </div>
         <div id="dateGroupInfo" class="note" style="margin-top:12px;display:none"></div>
       </div>
@@ -725,6 +729,22 @@
 </div>
 
 <script>
+if (typeof firebase === 'undefined') {
+  // The Firebase library scripts (from gstatic.com) never loaded — usually a
+  // blocked/limited network, an ad/script blocker, or an in-app browser that
+  // restricts external scripts. Fail with a clear message instead of a
+  // silent crash.
+  document.getElementById('loginScreen').innerHTML = `
+    <div class="login-card">
+      <h2>تعذّر تحميل الصفحة</h2>
+      <p style="margin-bottom:0">
+        المتصفح منع تحميل مكتبات ضرورية (Firebase) من الإنترنت، غالبًا بسبب شبكة محدودة، أداة حجب إعلانات، أو متصفح داخلي مقيّد.
+        <br><br>
+        جرّب تفتح الملف في متصفح عادي (Chrome أو Safari) بدل ما يكون جوا تطبيق تاني، وتأكد من اتصالك بالإنترنت، وحاول تاني.
+      </p>
+    </div>
+  `;
+} else {
 /* ==========================================================================
    STATE
    ========================================================================== */
@@ -2512,7 +2532,7 @@ function renderDateGroups(){
   lastDateGroups = buildDateGroups();
   const tbody = document.getElementById('dateGroupBody');
   if(!lastDateGroups.length){
-    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--ink-faint)">لا توجد فواتير</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--ink-faint)">لا توجد فواتير</td></tr>`;
     return;
   }
   tbody.innerHTML = lastDateGroups.map((g,i)=>`
@@ -2522,6 +2542,7 @@ function renderDateGroups(){
       <td class="num">${g.batchLabel}</td>
       <td class="num">${fmtNum(g.count)}</td>
       <td class="num">${fmtNum(g.value)}</td>
+      <td><input type="date" class="date-group-custom" data-idx="${i}" style="padding:5px 8px;border:1px solid var(--border);border-radius:7px;font-family:inherit;font-size:12.5px;width:145px"></td>
     </tr>`).join('');
   document.querySelectorAll('.date-group-check').forEach(cb=>{
     cb.addEventListener('change', updateDateGroupSelCount);
@@ -2543,12 +2564,38 @@ document.getElementById('dateGroupSelectAll').addEventListener('change', (e)=>{
   updateDateGroupSelCount();
 });
 
+// Shared apply logic for both buttons — moves: [{ group, newDate }]. Matches
+// invoices by their CURRENT (date, import-batch) key before any mutation, so
+// moving one group can never accidentally sweep up another group's invoices
+// even if they happen to land on the same date afterward.
+async function applyDateGroupMoves(moves){
+  const keyToNewDate = new Map(moves.map(m=>[m.group.date+'||'+m.group.batchKey, m.newDate]));
+  const targets = INVOICES.filter(r=>{
+    const d = fmtDate(r.date) || '(بدون تاريخ)';
+    const batchKey = r.importedAt || 'unknown';
+    return keyToNewDate.has(d+'||'+batchKey);
+  });
+  for(const chunk of chunkArray(targets, 450)){
+    const batch = db.batch();
+    chunk.forEach(inv=>{
+      const d = fmtDate(inv.date) || '(بدون تاريخ)';
+      const batchKey = inv.importedAt || 'unknown';
+      const newDate = keyToNewDate.get(d+'||'+batchKey);
+      inv.date = newDate;
+      batch.set(invoicesCol.doc(String(inv.code)), { date: newDate }, { merge:true });
+    });
+    await batch.commit();
+  }
+  return targets.length;
+}
+
 document.getElementById('dateGroupShiftBtn').addEventListener('click', async ()=>{
   if(!isAdmin()){ toast('هذا الإجراء متاح للمدير فقط','warn'); return; }
   const selected = getSelectedDateGroups().filter(g => g.date !== '(بدون تاريخ)');
   if(!selected.length){ toast('حدد صف واحد على الأقل','warn'); return; }
 
-  const preview = selected.map(g=>`${g.date} (${g.batchLabel}) ← ${addOneDayISO(g.date)}`).join('، ');
+  const moves = selected.map(g=>({ group: g, newDate: addOneDayISO(g.date) }));
+  const preview = moves.map(m=>`${m.group.date} (${m.group.batchLabel}) ← ${m.newDate}`).join('، ');
   const affectedCount = selected.reduce((s,g)=>s+g.count,0);
   const ok = await confirmDialog(
     'تحويل تواريخ صفوف محددة',
@@ -2560,29 +2607,52 @@ document.getElementById('dateGroupShiftBtn').addEventListener('click', async ()=
   infoBox.style.display='block'; infoBox.className='note';
   infoBox.textContent = 'جارٍ التحويل...';
   try{
-    const selectedKeys = new Set(selected.map(g=>g.date+'||'+g.batchKey));
-    const targets = INVOICES.filter(r=>{
-      const d = fmtDate(r.date) || '(بدون تاريخ)';
-      const batchKey = r.importedAt || 'unknown';
-      return selectedKeys.has(d+'||'+batchKey);
-    });
-    for(const chunk of chunkArray(targets, 450)){
-      const batch = db.batch();
-      chunk.forEach(inv=>{
-        const newDate = addOneDayISO(fmtDate(inv.date));
-        inv.date = newDate;
-        batch.set(invoicesCol.doc(String(inv.code)), { date: newDate }, { merge:true });
-      });
-      await batch.commit();
-    }
+    const n = await applyDateGroupMoves(moves);
     infoBox.className = 'note ok';
-    infoBox.textContent = `تم تحويل ${targets.length} فاتورة بنجاح.`;
+    infoBox.textContent = `تم تحويل ${n} فاتورة بنجاح.`;
     toast('تم التحويل بنجاح');
     renderDateGroups();
     renderDashboard();
   }catch(e){
     infoBox.className = 'note warn';
     infoBox.textContent = 'تعذّر التحويل: '+e.message;
+  }
+});
+
+document.getElementById('dateGroupCustomBtn').addEventListener('click', async ()=>{
+  if(!isAdmin()){ toast('هذا الإجراء متاح للمدير فقط','warn'); return; }
+  const moves = [];
+  document.querySelectorAll('.date-group-custom').forEach(inp=>{
+    const val = inp.value;
+    if(!val) return;
+    const g = lastDateGroups[Number(inp.dataset.idx)];
+    if(!g || g.date === '(بدون تاريخ)') return;
+    if(val === g.date) return; // already that date — nothing to do
+    moves.push({ group: g, newDate: val });
+  });
+  if(!moves.length){ toast('اكتب تاريخ جديد مختلف لصف واحد على الأقل في عمود "تاريخ جديد"','warn'); return; }
+
+  const preview = moves.map(m=>`${m.group.date} (${m.group.batchLabel}) ← ${m.newDate}`).join('، ');
+  const affectedCount = moves.reduce((s,m)=>s+m.group.count,0);
+  const ok = await confirmDialog(
+    'تعديل تواريخ إلى تواريخ محددة',
+    `سيتم تغيير تاريخ ${affectedCount} فاتورة كالتالي: ${preview}. هل تريد المتابعة؟`
+  );
+  if(!ok) return;
+
+  const infoBox = document.getElementById('dateGroupInfo');
+  infoBox.style.display='block'; infoBox.className='note';
+  infoBox.textContent = 'جارٍ التعديل...';
+  try{
+    const n = await applyDateGroupMoves(moves);
+    infoBox.className = 'note ok';
+    infoBox.textContent = `تم تعديل تاريخ ${n} فاتورة بنجاح.`;
+    toast('تم التعديل بنجاح');
+    renderDateGroups();
+    renderDashboard();
+  }catch(e){
+    infoBox.className = 'note warn';
+    infoBox.textContent = 'تعذّر التعديل: '+e.message;
   }
 });
 
@@ -2599,6 +2669,7 @@ function addOneDayISO(iso){
    ========================================================================== */
 renderDashboard();
 tryRestoreSession();
+}
 </script>
 </body>
 </html>
